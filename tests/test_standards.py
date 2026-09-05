@@ -356,6 +356,65 @@ def test_sync_standards_full_lifecycle(tmp_path: Path) -> None:
         app.close()
 
 
+def test_sync_standards_cheap_fingerprint_skips_extraction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mtime+size fingerprint short-circuits re-extraction/re-hashing
+    of an unchanged file, but still detects a real content change, and a
+    same-content mtime bump still lands on "up-to-date" (via the
+    pre-existing digest dedup, one re-extraction later)."""
+    import corvidex_mcp.standards as standards_mod
+
+    data = tmp_path / "data"
+    data.mkdir()
+    std = tmp_path / "standards.md"
+    std.write_text(STANDARD_MD, encoding="utf-8")
+    config = make_config(tmp_path, std)
+    app = make_app(config)
+    calls = 0
+    real_extract = standards_mod.extract_standards_text
+
+    def spy_extract(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return real_extract(path)
+
+    monkeypatch.setattr(standards_mod, "extract_standards_text", spy_extract)
+    try:
+        report = sync_coding_standards(config, app.providers, app.store, app.states)
+        assert report is not None and report["status"] == "ok", report
+        assert calls == 1
+        fp_after_first = app.states.get(CODING_STANDARDS_REPO).local_fingerprint
+        assert fp_after_first is not None
+
+        # (a) Unchanged file: the cheap fingerprint alone short-circuits
+        # before extract_standards_text is even called again.
+        report = sync_coding_standards(config, app.providers, app.store, app.states)
+        assert report is not None and report["status"] == "up-to-date", report
+        assert calls == 1
+
+        # (b) Touch mtime without changing content: the cheap fingerprint
+        # changes, triggering one re-extraction, but the content-hash
+        # dedup still reports up-to-date (no reindex).
+        first_commit = app.states.get(CODING_STANDARDS_REPO).indexed_commit
+        os.utime(std, ns=(std.stat().st_atime_ns + 5_000_000_000,) * 2)
+        report = sync_coding_standards(config, app.providers, app.store, app.states)
+        assert report is not None and report["status"] == "up-to-date", report
+        assert calls == 2
+        assert app.states.get(CODING_STANDARDS_REPO).indexed_commit == first_commit
+        assert app.states.get(CODING_STANDARDS_REPO).local_fingerprint != fp_after_first
+
+        # (c) An actual content change is still detected and reindexed.
+        std.write_text(STANDARD_MD_V2, encoding="utf-8")
+        report = sync_coding_standards(config, app.providers, app.store, app.states)
+        assert report is not None and report["status"] == "ok", report
+        assert calls == 3
+        new_commit = app.states.get(CODING_STANDARDS_REPO).indexed_commit
+        assert new_commit and new_commit != first_commit
+    finally:
+        app.close()
+
+
 def test_sync_standards_missing_file_reports_error(tmp_path: Path) -> None:
     data = tmp_path / "data"
     data.mkdir()

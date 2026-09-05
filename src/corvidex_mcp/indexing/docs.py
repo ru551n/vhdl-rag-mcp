@@ -273,23 +273,22 @@ def chunk_doc_file(
         sections = _paragraph_sections(lines)
     stem = Path(file).stem
     chunks: list[Chunk] = []
+    # Section = the most recent heading at a strictly higher level before
+    # this chunk (its enclosing section); top-level sections have none.
+    # ``sections`` is already in file order (ascending start_line), so a
+    # stack of ancestor (level, heading) pairs finds it in one pass
+    # instead of rescanning the whole list per section.
+    ancestors: list[tuple[int, str]] = []
     for i, section in enumerate(sections):
         heading = (
             section.heading
             if section.heading
             else (stem if i == 0 else f"{stem} (cont.)")
         )
-        # Section = the most recent heading at a strictly higher level
-        # before this chunk (its enclosing section); top-level sections
-        # have none.
-        enclosing = [
-            s
-            for s in sections
-            if s.level < section.level and s.start_line < section.start_line
-        ]
-        section_ctx = (
-            max(enclosing, key=lambda s: s.start_line).heading if enclosing else None
-        )
+        while ancestors and ancestors[-1][0] >= section.level:
+            ancestors.pop()
+        section_ctx = ancestors[-1][1] if ancestors else None
+        ancestors.append((section.level, heading))
         chunks.append(
             Chunk(
                 repository=cfg.name,

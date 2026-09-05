@@ -73,6 +73,8 @@ VERILOG_KEYWORDS = frozenset(
 )
 
 _IDENT_RE = re.compile(r"`?[A-Za-z_][A-Za-z0-9_$]*")
+_BLOCK_OPEN_RE = re.compile(r"/\*")
+_BLOCK_CLOSE_RE = re.compile(r"\*/")
 _ALWAYS_START_RE = re.compile(r"^\s*always(?:_comb|_ff|_latch)?\b", re.I)
 _FUNCTION_START_RE = re.compile(r"^\s*function\b", re.I)
 _TASK_START_RE = re.compile(r"^\s*task\b", re.I)
@@ -153,22 +155,24 @@ def extract_identifiers(content: str) -> tuple[str, ...]:
 def _strip_block_comments(line: str, depth: int) -> tuple[str, int]:
     """Remove /* */ spans from one line; returns (code, depth)."""
     out: list[str] = []
-    i = 0
-    while i < len(line):
+    pos = 0
+    n = len(line)
+    while pos < n:
         if depth > 0:
-            # Inside a block comment: drop chars until the closing */.
-            if line[i : i + 2] == "*/":
-                depth = 0
-                i += 2
-            else:
-                i += 1
+            # Inside a block comment: drop up to the closing */.
+            close = _BLOCK_CLOSE_RE.search(line, pos)
+            if close is None:
+                break  # rest of the line is still inside the comment
+            depth = 0
+            pos = close.end()
             continue
-        if line[i : i + 2] == "/*":
-            depth = 1
-            i += 2
-            continue
-        out.append(line[i])
-        i += 1
+        open_ = _BLOCK_OPEN_RE.search(line, pos)
+        if open_ is None:
+            out.append(line[pos:])
+            break
+        out.append(line[pos : open_.start()])
+        depth = 1
+        pos = open_.end()
     return "".join(out), depth
 
 

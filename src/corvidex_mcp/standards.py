@@ -138,6 +138,24 @@ def _remove(store: VectorStore, states: StateStore) -> None:
         logger.info("%s: removed %d chunks", CODING_STANDARDS_REPO, deleted)
 
 
+def _local_fingerprint(path: Path) -> str | None:
+    """Cheap mtime+size fingerprint of the standards file, no read/parse.
+
+    Same idea as :meth:`GitManager.local_fingerprint`'s filesystem walk
+    fingerprint: a fast, read-only check for "did anything on disk
+    change" that a full extract-and-hash can be skipped for. ``None``
+    when the file cannot be stat'ed (e.g. it was deleted since the last
+    successful sync); the caller falls through to the normal
+    extract-and-fail path in that case rather than treating a vanished
+    file as "unchanged".
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return hashlib.sha256(f"{st.st_mtime_ns}\t{st.st_size}".encode()).hexdigest()
+
+
 def sync_coding_standards(
     config: AppConfig,
     providers: EmbeddingProviders,
@@ -157,6 +175,22 @@ def sync_coding_standards(
         _remove(store, states)
         return None
     name = CODING_STANDARDS_REPO
+    cheap_fingerprint = _local_fingerprint(path)
+    state = states.get(name)
+    if (
+        cheap_fingerprint is not None
+        and cheap_fingerprint == state.local_fingerprint
+        and state.indexed_commit is not None
+    ):
+        # mtime/size unchanged since the last successful sync: the
+        # extracted text (a possibly expensive PDF/DOCX re-parse) cannot
+        # have changed either, so skip straight to "up-to-date".
+        states.record_sync(name, None)
+        return {
+            "repository": name,
+            "status": "up-to-date",
+            "commit": state.indexed_commit[:12],
+        }
     try:
         text = extract_standards_text(path)
     except StandardsError as exc:
@@ -165,6 +199,8 @@ def sync_coding_standards(
         return {"repository": name, "status": "error", "error": str(exc)}
     digest = standards_hash(text)
     if states.get(name).indexed_commit == digest:
+        if cheap_fingerprint is not None:
+            states.set_local_fingerprint(name, cheap_fingerprint)
         states.record_sync(name, None)
         return {
             "repository": name,
@@ -184,6 +220,8 @@ def sync_coding_standards(
         states.record_sync(name, str(exc))
         return {"repository": name, "status": "error", "error": str(exc)}
     states.set_indexed(name, digest, file_count=len(chunks))
+    if cheap_fingerprint is not None:
+        states.set_local_fingerprint(name, cheap_fingerprint)
     states.record_sync(name, None)
     logger.info("%s: indexed %d chunks at %s", name, len(chunks), digest[:12])
     return {

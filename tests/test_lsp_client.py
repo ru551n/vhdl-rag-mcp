@@ -306,6 +306,24 @@ async def test_handshake_open_symbols_and_shutdown(fake_server: Path, workspace:
     assert not (workspace / "vhdl_ls.toml").exists()
 
 
+async def test_open_document_uses_given_text_without_disk_read(tmp_path: Path):
+    """``text=`` is used verbatim, skipping the disk read entirely."""
+    lsp = VhdlLsp("unused-binary", tmp_path)
+    captured: dict[str, object] = {}
+
+    async def fake_notify(method: str, params: dict[str, object]) -> None:
+        captured["method"] = method
+        captured["params"] = params
+
+    lsp._notify = fake_notify  # type: ignore[method-assign]
+    missing = tmp_path / "does-not-exist.vhd"  # never written to disk
+    await lsp.open_document(missing, text="entity given is end;\n")
+    assert captured["method"] == "textDocument/didOpen"
+    params = captured["params"]
+    assert isinstance(params, dict)
+    assert params["textDocument"]["text"] == "entity given is end;\n"  # type: ignore[index]
+
+
 async def test_repository_config_respected(fake_server: Path, workspace: Path):
     (workspace / "vhdl_ls.toml").write_text("[libraries.defaultlib]\nfiles = ['x']\n")
     lsp = VhdlLsp(str(fake_server), workspace)

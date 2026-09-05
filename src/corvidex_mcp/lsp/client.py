@@ -369,8 +369,9 @@ class LspClient:
 
     # -- document flow --------------------------------------------------------
 
-    async def open_document(self, path: Path) -> None:
-        """didOpen one file (content is read from the working tree).
+    async def open_document(self, path: Path, text: str | None = None) -> None:
+        """didOpen one file (content is read from the working tree, or
+        ``text`` is used verbatim when the caller already has it).
 
         Never raises: a server that has died mid-session (some servers
         crash on malformed files) simply loses this file — its symbols
@@ -378,7 +379,8 @@ class LspClient:
         parsing.
         """
         uri = path_to_uri(path)
-        text = path.read_text(encoding="utf-8", errors="replace")
+        if text is None:
+            text = path.read_text(encoding="utf-8", errors="replace")
         try:
             await self._notify(
                 "textDocument/didOpen",

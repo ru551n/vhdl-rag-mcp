@@ -31,7 +31,7 @@ from tree_sitter_language_pack import get_language
 
 from ..config import RepositoryConfig
 from ..models import Chunk, CollectionName, ContentType
-from .common import MAX_CONTENT_CHARS, MAX_SYMBOLS, extract_code_identifiers
+from .common import MAX_CONTENT_CHARS, clamp_and_join, extract_code_identifiers
 
 logger = logging.getLogger(__name__)
 
@@ -233,9 +233,7 @@ def chunk_code_file(
         units.sort(key=lambda u: u.start_line)
     chunks: list[Chunk] = []
     for unit in units:
-        start = max(1, min(unit.start_line, len(lines)))
-        end = max(start, min(unit.end_line, len(lines)))
-        text = "\n".join(lines[start - 1 : end])
+        start, end, text = clamp_and_join(lines, unit.start_line, unit.end_line)
         chunks.append(
             Chunk(
                 repository=cfg.name,
@@ -250,7 +248,7 @@ def chunk_code_file(
                 start_line=start,
                 end_line=end,
                 content=text[:MAX_CONTENT_CHARS],
-                symbols=extract_code_identifiers(text)[:MAX_SYMBOLS],
+                symbols=extract_code_identifiers(text),
             )
         )
     return chunks

@@ -24,12 +24,20 @@ import asyncio
 import dataclasses
 import hashlib
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 from ..config import AppConfig, RepositoryConfig
 from ..embeddings.providers import EmbeddingProviders
 from ..git_manager import GitManager, SyncPlan
-from ..lsp import VeridianLsp, VhdlLsp, default_libraries_dir, resolve_binary
+from ..lsp import (
+    LspClient,
+    SymbolInfo,
+    VeridianLsp,
+    VhdlLsp,
+    default_libraries_dir,
+    resolve_binary,
+)
 from ..models import Chunk, CollectionName, ContentType
 from ..routing import FileKind, classify_file
 from ..state import StateStore
@@ -318,49 +326,33 @@ class IndexPipeline:
             self._upsert(cfg, chunks)
             logger.info("%s: indexed %d chunks", cfg.name, len(chunks))
 
-    async def _chunk_vhdl_files(
-        self, cfg: RepositoryConfig, plan: SyncPlan, files: list[str]
+    async def _chunk_with_lsp(
+        self,
+        cfg: RepositoryConfig,
+        files: list[str],
+        lsp: LspClient,
+        chunk_fn: Callable[[str, str, tuple[SymbolInfo, ...] | None], list[Chunk]],
     ) -> list[Chunk]:
-        """Chunk VHDL files with one LSP session for the whole plan.
+        """Chunk ``files`` with one LSP session shared across all of them.
 
-        All files are opened first and the server is waited on once, so
-        the quiet window is not paid per file. Files with syntax errors
-        get the structural fallback (the LSP tree is partial there). When
-        vhdl_ls is unavailable every file uses the structural fallback.
+        Each file's content is read once (reused for both the LSP
+        ``didOpen`` and the chunker) and all files are opened before the
+        server is waited on once, so the quiet window is not paid per
+        file. A file with a syntax error, or whose ``document_symbols``
+        call fails/times out, falls back to ``chunk_fn``'s own structural
+        parsing (``lsp_symbols=None``) rather than aborting the whole
+        repository sync.
         """
         repo_dir = self._git.repo_dir(cfg)
-        if self._vhdl_ls_bin is None:
-            logger.info("%s: vhdl_ls unavailable; structural VHDL fallback", cfg.name)
-            chunks: list[Chunk] = []
-            for f in files:
-                content = self._git.read_file(cfg, f)
-                chunks.extend(
-                    chunk_vhdl_file(
-                        cfg,
-                        f,
-                        content,
-                        plan.commit,
-                        lsp_symbols=None,
-                        branch=plan.ref,
-                    )
-                )
-            return chunks
-        lsp = VhdlLsp(
-            self._vhdl_ls_bin,
-            repo_dir,
-            libraries_dir=self._vhdl_ls_libraries_dir,
-            vhdl_ls_hook=cfg.vhdl_ls_hook,
-            files=tuple(files),
-        )
-        chunks = []
+        contents = {f: self._git.read_file(cfg, f) for f in files}
+        chunks: list[Chunk] = []
         try:
             await lsp.start()
             for f in files:
-                await lsp.open_document(repo_dir / f)
+                await lsp.open_document(repo_dir / f, text=contents[f])
             await lsp.wait_until_quiet(timeout=max(20.0, 2.0 * len(files)))
             for f in files:
                 path: Path = repo_dir / f
-                content = self._git.read_file(cfg, f)
                 if lsp.has_syntax_error(path):
                     logger.info(
                         "%s: %s has syntax errors; using structural fallback",
@@ -382,19 +374,53 @@ class IndexPipeline:
                             exc,
                         )
                         symbols = None
+                chunks.extend(chunk_fn(f, contents[f], symbols))
+        finally:
+            await lsp.shutdown()
+        return chunks
+
+    async def _chunk_vhdl_files(
+        self, cfg: RepositoryConfig, plan: SyncPlan, files: list[str]
+    ) -> list[Chunk]:
+        """Chunk VHDL files with one LSP session for the whole plan.
+
+        All files are opened first and the server is waited on once, so
+        the quiet window is not paid per file. Files with syntax errors
+        get the structural fallback (the LSP tree is partial there). When
+        vhdl_ls is unavailable every file uses the structural fallback.
+        """
+        if self._vhdl_ls_bin is None:
+            logger.info("%s: vhdl_ls unavailable; structural VHDL fallback", cfg.name)
+            chunks: list[Chunk] = []
+            for f in files:
+                content = self._git.read_file(cfg, f)
                 chunks.extend(
                     chunk_vhdl_file(
                         cfg,
                         f,
                         content,
                         plan.commit,
-                        lsp_symbols=symbols,
+                        lsp_symbols=None,
                         branch=plan.ref,
                     )
                 )
-        finally:
-            await lsp.shutdown()
-        return chunks
+            return chunks
+        lsp = VhdlLsp(
+            self._vhdl_ls_bin,
+            self._git.repo_dir(cfg),
+            libraries_dir=self._vhdl_ls_libraries_dir,
+            vhdl_ls_hook=cfg.vhdl_ls_hook,
+            files=tuple(files),
+        )
+
+        def chunk_fn(
+            f: str, content: str, symbols: tuple[SymbolInfo, ...] | None
+        ) -> list[Chunk]:
+            return chunk_vhdl_file(
+                cfg, f, content, plan.commit, lsp_symbols=symbols, branch=plan.ref
+            )
+
+        return await self._chunk_with_lsp(cfg, files, lsp, chunk_fn)
 
     async def _chunk_verilog_sv_files(
         self,
@@ -409,7 +435,6 @@ class IndexPipeline:
         used per file (graceful fallback): the whole file becomes one
         chunk so no Verilog/SV is lost from the index.
         """
-        repo_dir = self._git.repo_dir(cfg)
         if self._veridian_bin is None:
             logger.info(
                 "%s: Veridian unavailable; generic parser fallback for "
@@ -440,51 +465,24 @@ class IndexPipeline:
             **dict.fromkeys(verilog_files, "verilog"),
             **dict.fromkeys(systemverilog_files, "systemverilog"),
         }
-        lsp = VeridianLsp(self._veridian_bin, repo_dir, config_hook=cfg.veridian_hook)
-        chunks = []
-        try:
-            await lsp.start()
-            for f in all_files:
-                await lsp.open_document(repo_dir / f)
-            await lsp.wait_until_quiet(timeout=max(20.0, 2.0 * len(all_files)))
-            for f in all_files:
-                path: Path = repo_dir / f
-                content = self._git.read_file(cfg, f)
-                if lsp.has_syntax_error(path):
-                    logger.info(
-                        "%s: %s has syntax errors; using structural fallback",
-                        cfg.name,
-                        f,
-                    )
-                    symbols = None
-                else:
-                    try:
-                        symbols = await lsp.document_symbols(path)
-                    except Exception as exc:  # LspError/timeout, or any other
-                        # per-file LSP crash: contain it to this file so one
-                        # bad file cannot abort the whole repository sync.
-                        logger.warning(
-                            "%s: %s: document_symbols failed (%s); using "
-                            "structural fallback",
-                            cfg.name,
-                            f,
-                            exc,
-                        )
-                        symbols = None
-                chunks.extend(
-                    chunk_verilog_file(
-                        cfg,
-                        f,
-                        content,
-                        plan.commit,
-                        language_by_file[f],
-                        lsp_symbols=symbols,
-                        branch=plan.ref,
-                    )
-                )
-        finally:
-            await lsp.shutdown()
-        return chunks
+        lsp = VeridianLsp(
+            self._veridian_bin, self._git.repo_dir(cfg), config_hook=cfg.veridian_hook
+        )
+
+        def chunk_fn(
+            f: str, content: str, symbols: tuple[SymbolInfo, ...] | None
+        ) -> list[Chunk]:
+            return chunk_verilog_file(
+                cfg,
+                f,
+                content,
+                plan.commit,
+                language_by_file[f],
+                lsp_symbols=symbols,
+                branch=plan.ref,
+            )
+
+        return await self._chunk_with_lsp(cfg, all_files, lsp, chunk_fn)
 
     #: Embed/upsert stream size: passages are embedded and upserted in
     #: groups this large, so the resident passage/vector buffers (and

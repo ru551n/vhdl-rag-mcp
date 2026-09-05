@@ -400,3 +400,12 @@ class StateStore:
         state.last_sync_at = _utcnow()
         state.last_sync_error = error
         self._upsert(state)
+
+    def set_local_fingerprint(self, name: str, fingerprint: str) -> None:
+        """Persist a cheap local fingerprint (mtime/size or working-tree
+        status) without touching the other sync/index fields. Used by
+        pseudo-repositories (e.g. the coding-standards file) that have no
+        git plan of their own to carry it alongside."""
+        state = self.get(name)
+        state.local_fingerprint = fingerprint
+        self._upsert(state)

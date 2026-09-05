@@ -30,15 +30,9 @@ from pathlib import Path
 from ..config import RepositoryConfig
 from ..lsp.client import SymbolInfo
 from ..models import Chunk, CollectionName, ContentType
-from .common import MAX_CONTENT_CHARS
+from .common import MAX_CONTENT_CHARS, MAX_SYMBOLS, MIN_INNER_SPAN
 
 logger = logging.getLogger(__name__)
-
-#: Minimum line span for an inner construct (process/function/procedure)
-#: to earn its own chunk; smaller ones stay covered by the parent chunk.
-MIN_INNER_SPAN = 5
-#: Identifier cap per chunk (payload size bound).
-MAX_SYMBOLS = 100
 
 VHDL_KEYWORDS = frozenset(
     """
@@ -119,22 +113,21 @@ def extract_identifiers(content: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
+_KIND_WORD_RE = re.compile(
+    r"^\s*(entity|architecture|package|configuration|process|function|procedure)\b",
+    re.I,
+)
+_PACKAGE_BODY_RE = re.compile(r"^\s*package\s+body\b", re.I)
+
+
 def _refine_kind(kind: str, first_line: str) -> str:
     """Disambiguate a construct kind using its declaration line."""
-    match = re.match(
-        r"^\s*(entity|architecture|package|configuration|process|function|procedure)\b",
-        first_line,
-        re.I,
-    )
+    match = _KIND_WORD_RE.match(first_line)
     if not match:
         return kind
     word = match.group(1).lower()
     if word == "package":
-        return (
-            "package_body"
-            if re.match(r"^\s*package\s+body\b", first_line, re.I)
-            else "package"
-        )
+        return "package_body" if _PACKAGE_BODY_RE.match(first_line) else "package"
     return word
 
 
@@ -158,6 +151,9 @@ def _resolve_name(symbol: SymbolInfo) -> tuple[str, str]:
     return kind, symbol.name
 
 
+_ARCH_OF_RE = re.compile(r"^\s*architecture\s+[A-Za-z_]\w*\s+of\s+([A-Za-z_]\w*)", re.I)
+
+
 def _context_for(
     kind: str, name: str, first_line: str
 ) -> tuple[str | None, str | None]:
@@ -165,9 +161,7 @@ def _context_for(
     if kind == "entity":
         return name, None
     if kind == "architecture":
-        match = re.match(
-            r"^\s*architecture\s+[A-Za-z_]\w*\s+of\s+([A-Za-z_]\w*)", first_line, re.I
-        )
+        match = _ARCH_OF_RE.match(first_line)
         return (match.group(1) if match else None), name
     return None, None
 
@@ -262,6 +256,7 @@ _START_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 _PROCESS_START_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*\s*:\s*)?process\b", re.I)
 _SUBPROGRAM_START_RE = re.compile(r"^\s*(function|procedure)\s+([A-Za-z_]\w*)")
+_PROCESS_LABEL_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*:\s*process\b", re.I)
 
 
 def _end_pattern(kind: str, name: str) -> re.Pattern[str]:
@@ -363,9 +358,7 @@ def _specs_from_scan(lines: list[str]) -> list[ChunkSpec]:
         if outer[0] == "architecture" and (
             proc_match := _PROCESS_START_RE.match(stripped)
         ):
-            label_match = re.match(
-                r"^\s*([A-Za-z_]\w*)\s*:\s*process\b", stripped, re.I
-            )
+            label_match = _PROCESS_LABEL_RE.match(stripped)
             name = label_match.group(1) if label_match else "process"
             inner = ("process", name, i)
             inner_end = _end_pattern("process", name)
